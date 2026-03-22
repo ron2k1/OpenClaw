@@ -13,6 +13,7 @@ Every decision is logged to audit_log.jsonl.
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ AGENT_ENABLED_FILE = AGENT_CONTROL / "AGENT_ENABLED"
 AGENT_MODE_FILE = AGENT_CONTROL / "AGENT_MODE"
 AUDIT_LOG = PROJECT_ROOT / "audit_log.jsonl"
 PENDING_APPROVAL = PROJECT_ROOT / "tasks" / "pending_approval.json"
+DYNAMIC_GATEKEEPER = AGENT_CONTROL / "DYNAMIC_GATEKEEPER"  # touch this file to enable AI classification
 
 # ---------------------------------------------------------------------------
 # Permission tier definitions
@@ -132,21 +134,88 @@ def get_agent_mode() -> str:
     return mode
 
 
+def _find_claude() -> str:
+    """Find claude executable."""
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(path_dir) / "claude.exe"
+        if candidate.exists():
+            return str(candidate)
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "claude.exe",
+        Path("C:/Users/ronil/AppData/Local/Microsoft/WinGet/Links/claude.exe"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return "claude"
+
+
+def classify_task_dynamic(task_description: str) -> str:
+    """
+    Use Claude to classify a task when regex patterns don't match.
+
+    Returns ALLOWED, SENSITIVE, or BLOCKED.
+    Falls back to SENSITIVE on any error (fail-safe).
+    """
+    prompt = (
+        "You are a security gatekeeper for an AI agent pipeline. "
+        "Classify the following task into exactly one tier.\n\n"
+        "ALLOWED: Safe operations like reading files, creating files, editing code, "
+        "running tests, adding features, fixing bugs, refactoring, explaining code, "
+        "searching, reviewing, analyzing, formatting, building, installing deps.\n\n"
+        "SENSITIVE: Operations needing human review like deleting files, pushing to git, "
+        "modifying core/auth/security code, database schema changes, removing features, "
+        "overwriting data, any destructive or irreversible action.\n\n"
+        "BLOCKED: Never allowed like force push, rm -rf /, arbitrary code execution from "
+        "URLs, format drives, shutdown/reboot, fork bombs, anything that could destroy "
+        "data or compromise the system.\n\n"
+        f"Task: {task_description}\n\n"
+        "Reply with ONLY one word: ALLOWED, SENSITIVE, or BLOCKED"
+    )
+
+    try:
+        claude_exe = _find_claude()
+        result = subprocess.run(
+            [claude_exe, "--print", prompt],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip().upper()
+
+        # Extract the tier from the response
+        if "BLOCKED" in output:
+            return Tier.BLOCKED
+        if "ALLOWED" in output:
+            return Tier.ALLOWED
+        if "SENSITIVE" in output:
+            return Tier.SENSITIVE
+
+        # Couldn't parse, fail safe
+        return Tier.SENSITIVE
+    except Exception:
+        return Tier.SENSITIVE
+
+
+def is_dynamic_enabled() -> bool:
+    """Check if dynamic (AI) classification is enabled."""
+    return DYNAMIC_GATEKEEPER.exists()
+
+
 def classify_task(task_description: str) -> str:
     """
     Classify a task description into a permission tier.
 
-    Checks in order: BLOCKED -> SENSITIVE -> ALLOWED.
-    Unknown tasks default to SENSITIVE (fail-safe).
+    Checks in order: BLOCKED -> SENSITIVE -> ALLOWED (all via regex).
+    If no regex matches and dynamic gatekeeper is enabled, asks Claude.
+    Otherwise unknown tasks default to SENSITIVE (fail-safe).
     """
     text = task_description.lower().strip()
 
-    # Check blocked first — these are never allowed
+    # Check blocked first
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return Tier.BLOCKED
 
-    # Check sensitive — needs human approval
+    # Check sensitive
     for pattern in SENSITIVE_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return Tier.SENSITIVE
@@ -156,7 +225,11 @@ def classify_task(task_description: str) -> str:
         if re.search(pattern, text, re.IGNORECASE):
             return Tier.ALLOWED
 
-    # Unknown tasks default to SENSITIVE (fail-safe, not fail-open)
+    # No regex matched: use dynamic classification if enabled
+    if is_dynamic_enabled():
+        return classify_task_dynamic(task_description)
+
+    # Fallback: unknown tasks default to SENSITIVE (fail-safe)
     return Tier.SENSITIVE
 
 
@@ -356,9 +429,11 @@ def main():
     elif arg == "--status":
         enabled = is_agent_enabled()
         mode = get_agent_mode()
+        dynamic = is_dynamic_enabled()
         pending = check_pending_approval()
-        print(f"Agent enabled: {enabled}")
-        print(f"Agent mode:    {mode}")
+        print(f"Agent enabled:  {enabled}")
+        print(f"Agent mode:     {mode}")
+        print(f"Dynamic gate:   {dynamic}")
         if pending:
             print(f"Pending task:  {pending['task']}")
             print(f"  Status:      {pending['status']}")
@@ -387,6 +462,16 @@ def main():
             AGENT_CONTROL.mkdir(parents=True, exist_ok=True)
             AGENT_MODE_FILE.write_text(new_mode)
             print(f"Agent mode set to: {new_mode}")
+
+    elif arg == "--dynamic-on":
+        AGENT_CONTROL.mkdir(parents=True, exist_ok=True)
+        DYNAMIC_GATEKEEPER.write_text("enabled")
+        print("Dynamic gatekeeper ENABLED (AI classification for unmatched tasks)")
+
+    elif arg == "--dynamic-off":
+        if DYNAMIC_GATEKEEPER.exists():
+            DYNAMIC_GATEKEEPER.unlink()
+        print("Dynamic gatekeeper DISABLED (regex-only, unmatched defaults to SENSITIVE)")
 
     else:
         # Treat as a task description to classify
