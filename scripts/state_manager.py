@@ -20,6 +20,29 @@ from pathlib import Path
 DEFAULT_PROJECT = Path("C:/Users/ronil/Desktop/OpenClaw")
 
 
+def get_history_dir(project_root: Path = None) -> Path:
+    root = project_root or DEFAULT_PROJECT
+    return root / "tasks" / "state_history"
+
+
+def backup_state(project_root: Path = None):
+    """Save a timestamped snapshot of state.json before overwriting."""
+    path = get_state_path(project_root)
+    if not path.exists():
+        return
+    history_dir = get_history_dir(project_root)
+    history_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_path = history_dir / f"state_{timestamp}.json"
+    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Keep only last 50 backups
+    backups = sorted(history_dir.glob("state_*.json"))
+    if len(backups) > 50:
+        for old in backups[:-50]:
+            old.unlink()
+
+
 def get_state_path(project_root: Path = None) -> Path:
     root = project_root or DEFAULT_PROJECT
     return root / "tasks" / "state.json"
@@ -51,9 +74,13 @@ def write_state(
     self_heal_attempts: int = 0,
     quality_results: dict = None,
 ) -> dict:
-    """Write structured state to tasks/state.json."""
+    """Write structured state to tasks/state.json. Backs up previous state first."""
     path = get_state_path(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Backup previous state before overwriting
+    if path.exists():
+        backup_state(project_root or DEFAULT_PROJECT)
 
     # Read previous state to preserve history
     prev = read_state(project_root)

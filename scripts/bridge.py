@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -229,7 +230,9 @@ def main():
     parser.add_argument("--project", default=str(OPENCLAW_ROOT), help="Project directory")
     parser.add_argument("--mode", choices=["safe", "supervised", "autonomous"],
                         help="Override agent mode")
-    parser.add_argument("--branch", help="Git branch name to create before execution")
+    parser.add_argument("--branch", help="Git branch name (auto-generated if omitted for write tasks)")
+    parser.add_argument("--no-branch", action="store_true",
+                        help="Skip auto-branch even for write tasks")
     parser.add_argument("--print-only", action="store_true",
                         help="Read-only mode (claude --print)")
     parser.add_argument("--dry-run", action="store_true",
@@ -239,6 +242,12 @@ def main():
     parser.add_argument("--max-heal-attempts", type=int, default=3,
                         help="Max self-heal attempts")
     args = parser.parse_args()
+
+    # Auto-generate branch name for write tasks (non-print-only)
+    if not args.print_only and not args.dry_run and not args.branch and not args.no_branch:
+        slug = re.sub(r"[^a-z0-9]+", "-", args.task.lower())[:40].strip("-")
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        args.branch = f"agent/{slug}-{date_str}"
 
     # Step 0: Update CLAUDE.md primer
     update_primer(args.project, args.task)

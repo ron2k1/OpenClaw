@@ -1,0 +1,13 @@
+# Runtime data — changes every invocation, not source code
+audit_log.jsonl
+tasks/state.json
+tasks/state_history/
+tasks/pending_approval.json
+errors/build_failures.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Files created by Claude Code during tasks
+hello_world.*
