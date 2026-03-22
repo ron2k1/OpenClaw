@@ -72,15 +72,75 @@ def run_gatekeeper(task: str, mode: str = None) -> dict:
         sys.path.pop(0)
 
 
+def get_base_branch(project_path: str) -> str:
+    """Detect the default base branch (main or master)."""
+    for candidate in ["main", "master"]:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            cwd=project_path, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return candidate
+    # Fallback: use whatever HEAD points to on origin
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        cwd=project_path, capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        # e.g. "refs/remotes/origin/main" -> "main"
+        return result.stdout.strip().split("/")[-1]
+    return "main"
+
+
 def create_branch(branch_name: str, project_path: str) -> bool:
-    """Create and checkout a git branch."""
+    """Create and checkout a git branch from the base branch.
+
+    Ensures isolation by switching back to main/master before creating the
+    new branch, so sequential tasks don't stack on each other.  Any
+    uncommitted changes are stashed beforehand and popped after checkout.
+    """
     try:
+        base = get_base_branch(project_path)
+
+        # Stash any uncommitted changes so checkout doesn't fail
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_path, capture_output=True, text=True,
+        )
+        has_changes = bool(status.stdout.strip())
+        if has_changes:
+            subprocess.run(
+                ["git", "stash", "push", "-m", f"bridge-auto-stash-before-{branch_name}"],
+                cwd=project_path, capture_output=True, text=True, check=True,
+            )
+
+        # Switch to base branch so the new branch forks from it
+        subprocess.run(
+            ["git", "checkout", base],
+            cwd=project_path, capture_output=True, text=True, check=True,
+        )
+
+        # Create and switch to the new task branch
         subprocess.run(
             ["git", "checkout", "-b", branch_name],
             cwd=project_path, capture_output=True, text=True, check=True,
         )
+
+        # Restore stashed changes if any
+        if has_changes:
+            subprocess.run(
+                ["git", "stash", "pop"],
+                cwd=project_path, capture_output=True, text=True,
+            )
+
         return True
     except subprocess.CalledProcessError:
+        # If something failed mid-way, try to pop stash so work isn't lost
+        if has_changes:
+            subprocess.run(
+                ["git", "stash", "pop"],
+                cwd=project_path, capture_output=True, text=True,
+            )
         return False
 
 
