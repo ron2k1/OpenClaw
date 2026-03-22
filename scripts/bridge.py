@@ -103,6 +103,38 @@ def get_changed_files(project_path: str) -> list:
         return []
 
 
+def auto_commit(project_path: str, task: str, branch: str = "") -> bool:
+    """Stage all changes and commit with a descriptive message."""
+    try:
+        # Stage all changes (new + modified)
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=project_path, capture_output=True, text=True, check=True,
+        )
+        # Check if there's anything to commit
+        status = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=project_path, capture_output=True, text=True,
+        )
+        if status.returncode == 0:
+            return False  # Nothing staged
+
+        # Build commit message
+        slug = task[:72]
+        msg = f"agent: {slug}"
+        if branch:
+            msg += f"\n\nBranch: {branch}"
+        msg += "\n\nAutomated commit by OpenClaw bridge"
+
+        subprocess.run(
+            ["git", "commit", "-m", msg],
+            cwd=project_path, capture_output=True, text=True, check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def run_claude(task: str, project_path: str, print_only: bool = False) -> dict:
     """Invoke Claude Code CLI and capture output."""
     claude_exe = find_claude()
@@ -115,7 +147,7 @@ def run_claude(task: str, project_path: str, print_only: bool = False) -> dict:
 
     try:
         result = subprocess.run(
-            cmd, cwd=project_path, capture_output=True, text=True, timeout=300,
+            cmd, cwd=project_path, capture_output=True, text=True, timeout=600,
         )
         return {
             "output": result.stdout, "stderr": result.stderr,
@@ -366,6 +398,9 @@ def main():
                 output["success"] = True
                 output["error"] = None
                 output["files_changed"] = get_changed_files(args.project)
+                if output["files_changed"]:
+                    committed = auto_commit(args.project, args.task, args.branch or "")
+                    output["committed"] = committed
                 log_audit(args.task, gate_result["tier"], "self_healed",
                           gate_result["mode"],
                           f"Healed after {heal_result['attempts']} attempt(s)")
@@ -389,6 +424,11 @@ def main():
         # Success
         output["success"] = True
         output["files_changed"] = get_changed_files(args.project)
+
+        # Step 5a: Auto-commit changes
+        if not args.print_only and output["files_changed"]:
+            committed = auto_commit(args.project, args.task, args.branch or "")
+            output["committed"] = committed
 
         # Parse Claude's JSON output for extra data
         parsed = parse_claude_json_output(claude_result["output"])
