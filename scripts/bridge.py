@@ -291,6 +291,30 @@ def write_obsidian(project: str, task: str, status: str, gate_result: dict,
             sys.path.remove(str(SCRIPTS_DIR))
 
 
+def run_quality_gates(project: str, files_changed: list, task: str,
+                      skip_adversarial: bool = False, skip_coverage: bool = False,
+                      skip_regression: bool = False) -> dict:
+    """Run the quality gate pipeline."""
+    try:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from quality_gate import run_quality_pipeline
+        return run_quality_pipeline(
+            project_path=project,
+            files_changed=files_changed,
+            task=task,
+            skip_adversarial=skip_adversarial,
+            skip_coverage=skip_coverage,
+            skip_regression=skip_regression,
+        )
+    except Exception as e:
+        return {"passed": True, "gates": [], "hard_failures": [],
+                "soft_failures": [], "review_items": [],
+                "first_hard_error": None, "error": str(e)}
+    finally:
+        if str(SCRIPTS_DIR) in sys.path:
+            sys.path.remove(str(SCRIPTS_DIR))
+
+
 def run_self_heal(project: str, task: str, error_text: str, max_attempts: int = 3) -> dict:
     """Run the self-heal loop."""
     try:
@@ -326,6 +350,16 @@ def main():
                         help="Enable self-heal loop on failure (max 3 retries)")
     parser.add_argument("--max-heal-attempts", type=int, default=3,
                         help="Max self-heal attempts")
+    parser.add_argument("--quality-gates", action="store_true",
+                        help="Run quality gate pipeline after Claude succeeds")
+    parser.add_argument("--skip-adversarial", action="store_true",
+                        help="Skip adversarial Claude review gate")
+    parser.add_argument("--skip-coverage", action="store_true",
+                        help="Skip coverage check gate")
+    parser.add_argument("--skip-regression", action="store_true",
+                        help="Skip regression check gate")
+    parser.add_argument("--auto-push", action="store_true",
+                        help="Push branch to remote after successful commit")
     args = parser.parse_args()
 
     # Auto-generate branch name for write tasks (non-print-only)
@@ -444,24 +478,77 @@ def main():
                         error=output["error"])
 
     else:
-        # Success
+        # Success — Claude exited cleanly
         output["success"] = True
         output["files_changed"] = get_changed_files(args.project)
-
-        # Step 5a: Auto-commit changes
-        if not args.print_only and output["files_changed"]:
-            committed = auto_commit(args.project, args.task, args.branch or "")
-            output["committed"] = committed
 
         # Parse Claude's JSON output for extra data
         parsed = parse_claude_json_output(claude_result["output"])
         output["cost_usd"] = parsed.get("cost_usd", 0)
 
-        log_audit(args.task, gate_result["tier"], "completed",
-                  gate_result["mode"], f"Files changed: {len(output['files_changed'])}")
-        write_state(args.project, args.task, "success", gate_result, claude_result,
-                    output["files_changed"],
-                    next_suggested=f"Review changes: {', '.join(output['files_changed'][:5])}")
+        # Step 5: Quality gates (if enabled)
+        if args.quality_gates and not args.print_only and output["files_changed"]:
+            qg_result = run_quality_gates(
+                args.project, output["files_changed"], args.task,
+                skip_adversarial=args.skip_adversarial,
+                skip_coverage=args.skip_coverage,
+                skip_regression=args.skip_regression,
+            )
+            output["quality_gates"] = qg_result
+
+            if not qg_result["passed"]:
+                # Hard gate failed — try self-heal if enabled
+                if args.self_heal and qg_result.get("first_hard_error"):
+                    heal_result = run_self_heal(
+                        args.project, args.task, qg_result["first_hard_error"],
+                        args.max_heal_attempts,
+                    )
+                    output["self_heal"] = heal_result
+                    if heal_result["healed"]:
+                        output["files_changed"] = get_changed_files(args.project)
+                        log_audit(args.task, gate_result["tier"], "quality_healed",
+                                  gate_result["mode"],
+                                  f"Quality gate healed after {heal_result['attempts']} attempt(s)")
+                    else:
+                        output["success"] = False
+                        output["error"] = f"Quality gates failed: {', '.join(qg_result['hard_failures'])}"
+                        log_audit(args.task, gate_result["tier"], "quality_failed",
+                                  gate_result["mode"], output["error"])
+                        write_state(args.project, args.task, "quality_failed", gate_result,
+                                    claude_result, output["files_changed"],
+                                    quality_results=qg_result)
+                else:
+                    output["success"] = False
+                    output["error"] = f"Quality gates failed: {', '.join(qg_result['hard_failures'])}"
+                    log_audit(args.task, gate_result["tier"], "quality_failed",
+                              gate_result["mode"], output["error"])
+                    write_state(args.project, args.task, "quality_failed", gate_result,
+                                claude_result, output["files_changed"],
+                                quality_results=qg_result)
+
+        # Step 5a: Auto-commit (only if still successful)
+        if output["success"] and not args.print_only and output["files_changed"]:
+            committed = auto_commit(args.project, args.task, args.branch or "")
+            output["committed"] = committed
+
+            # Step 5b: Auto-push (if enabled and committed)
+            if args.auto_push and committed and args.branch:
+                try:
+                    push_result = subprocess.run(
+                        ["git", "push", "-u", "origin", args.branch],
+                        cwd=args.project, capture_output=True, text=True, timeout=60,
+                    )
+                    output["pushed"] = push_result.returncode == 0
+                except Exception:
+                    output["pushed"] = False
+
+        if output["success"]:
+            log_audit(args.task, gate_result["tier"], "completed",
+                      gate_result["mode"], f"Files changed: {len(output['files_changed'])}")
+            write_state(args.project, args.task, "success", gate_result, claude_result,
+                        output["files_changed"],
+                        quality_results=output.get("quality_gates"),
+                        next_suggested=f"Review changes: {', '.join(output['files_changed'][:5])}")
 
     # Step 6: Write to Obsidian vault
     cost = output.get("cost_usd", 0)

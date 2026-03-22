@@ -32,6 +32,12 @@ Always use `exec` to run `bridge.py`. Required arguments:
 | `--mode` | Override agent mode: `safe`, `supervised`, `autonomous` (reads from AGENT_MODE file if omitted) |
 | `--branch` | Create a git branch before execution (e.g., `agent/feature-name-20260321`) |
 | `--print-only` | Use `claude --print` (no file writes, read-only) instead of `claude --yes` |
+| `--self-heal` | Enable self-heal loop on failure (max 3 retries) |
+| `--quality-gates` | Run 8-layer quality pipeline after Claude succeeds (build, lint, security, unsafe scan, tests, coverage, adversarial review, regression) |
+| `--skip-adversarial` | Skip the adversarial Claude review gate |
+| `--skip-coverage` | Skip the coverage check gate |
+| `--skip-regression` | Skip the regression check gate |
+| `--auto-push` | Push branch to remote after successful commit |
 
 ### Step 2: Read the output
 
