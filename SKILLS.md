@@ -96,6 +96,18 @@ You can also run the primer update standalone:
 python "C:/Users/ronil/Desktop/OpenClaw/scripts/update_primer.py" --task "description" --preview
 ```
 
+## Context Management
+
+**Context rot prevention is mandatory.** When running Claude Code in interactive (non `--print`) mode:
+
+- Monitor context usage. Once **40% of context has been used**, run `/compact` before continuing.
+- This applies to every Claude Code instance — whether launched for a single complex task or a multi-step session.
+- For sequential tasks via bridge.py `--print` mode: not applicable (each invocation is a fresh one-shot context).
+- For interactive sessions or self-heal loops: compact aggressively to prevent degraded output quality from context rot.
+
+**Rule for Grok/P.E.E.N.S.:** When launching Claude Code for complex multi-step work, include this instruction in the task prompt:
+> "If context reaches 40%, run /compact before continuing."
+
 ## Important Rules
 
 1. **Always run through bridge.py** — never call `claude` directly. The bridge enforces gatekeeper permissions and runs the primer update.
@@ -103,6 +115,7 @@ python "C:/Users/ronil/Desktop/OpenClaw/scripts/update_primer.py" --task "descri
 3. **Use `--branch` for modification tasks** — keeps changes isolated on a separate git branch.
 4. **If gatekeeper blocks**: Do not circumvent. Report to user with the reason.
 5. **Audit trail**: Every invocation is logged to `audit_log.jsonl` automatically.
+6. **Compact at 40%** — every interactive Claude Code session must compact context at 40% usage to prevent context rot.
 
 ## Gatekeeper Tiers
 
