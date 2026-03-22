@@ -103,9 +103,37 @@ File-based, instant:
 | Architectural drift over time | Obsidian decisions log + human code review |
 | Unsafe blocks with subtle UB | Every unsafe requires explicit human sign-off, no exceptions |
 
+### Telegram Remote Control
+`scripts/telegram_bot.py` — a standalone daemon that monitors the pipeline and exposes control via @MonitorialMangerBot on Telegram.
+
+**Notifications** (auto-sent on events):
+- Task completed/failed/blocked
+- Approval needed (with inline Approve/Deny buttons)
+- Self-heal attempts and exhaustion
+- Quality gate failures
+- Agent kill/resume events
+
+**Commands:**
+| Command | Action |
+|---------|--------|
+| `/status` | Current agent state, mode, last task, recent history |
+| `/approve` | Approve pending gated task |
+| `/deny [reason]` | Deny pending gated task |
+| `/kill` | Emergency stop — deletes `AGENT_ENABLED` |
+| `/resume` | Re-enable agent |
+| `/mode [safe\|supervised\|autonomous]` | Change security mode |
+| `/history [n]` | Last N audit log entries |
+
+**Architecture:** Zero coupling — tails `audit_log.jsonl` and polls `pending_approval.json`. Reads/writes the same files the pipeline uses. Only import is `gatekeeper.py` for approve/deny functions.
+
+**Config:** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (gitignored).
+
+**Start:** `python scripts/telegram_bot.py`
+
 ## What You Control
-- On/off switch (file-based, instant)
-- Permission mode (safe/supervised/autonomous)
-- Approval queue for sensitive operations
+- On/off switch (file-based, instant, or via Telegram `/kill` `/resume`)
+- Permission mode (safe/supervised/autonomous, or via Telegram `/mode`)
+- Approval queue for sensitive operations (in-person or via Telegram `/approve` `/deny`)
 - Final merge decision on every branch
 - Obsidian vault is always human-readable and editable
+- Full remote oversight via Telegram when away from desk

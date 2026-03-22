@@ -91,7 +91,8 @@ OpenClaw/
 ├── scripts/
 │   ├── update_primer.py       <- refreshes CLAUDE.md before each invocation
 │   ├── gatekeeper.py          <- permission classification + routing
-│   └── self_heal.py           <- compilation error retry loop
+│   ├── self_heal.py           <- compilation error retry loop
+│   └── telegram_bot.py        <- remote monitoring + control via Telegram
 ├── tasks/
 │   ├── state.json             <- structured invocation results
 │   └── accuracy_report.json   <- spec-vs-implementation audit
