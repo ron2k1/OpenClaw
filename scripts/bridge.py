@@ -432,7 +432,7 @@ def main():
     # Auto-generate branch name for write tasks (non-print-only)
     if not args.print_only and not args.dry_run and not args.branch and not args.no_branch:
         slug = re.sub(r"[^a-z0-9]+", "-", args.task.lower())[:40].strip("-")
-        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         args.branch = f"agent/{slug}-{date_str}"
 
     # Step 0a: Sync skill files to .openclaw workspace
