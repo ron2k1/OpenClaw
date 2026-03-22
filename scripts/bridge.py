@@ -25,6 +25,7 @@ OPENCLAW_ROOT = Path("C:/Users/ronil/Desktop/OpenClaw")
 GATEKEEPER = OPENCLAW_ROOT / "gatekeeper" / "gatekeeper.py"
 AUDIT_LOG = OPENCLAW_ROOT / "audit_log.jsonl"
 SCRIPTS_DIR = OPENCLAW_ROOT / "scripts"
+SKILL_DIR = Path.home() / ".openclaw" / "workspace" / "skills" / "claude-code-bridge" / "claude-code-bridge"
 
 # Claude Code executable — try common locations
 CLAUDE_CANDIDATES = [
@@ -195,6 +196,25 @@ def log_audit(task: str, tier: str, decision: str, mode: str, details: str = "")
         f.write(json.dumps(entry) + "\n")
 
 
+def sync_skill_files():
+    """Sync OpenClaw source files to the .openclaw skill directory."""
+    try:
+        import shutil
+        if not SKILL_DIR.exists():
+            return
+        syncs = [
+            (OPENCLAW_ROOT / "SKILLS.md", SKILL_DIR / "SKILL.md"),
+            (OPENCLAW_ROOT / "scripts" / "bridge.py", SKILL_DIR / "scripts" / "bridge.py"),
+            (OPENCLAW_ROOT / "gatekeeper" / "gatekeeper.py", SKILL_DIR / "scripts" / "gatekeeper.py"),
+        ]
+        for src, dst in syncs:
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+    except Exception:
+        pass
+
+
 def update_primer(project: str, task: str):
     """Run update_primer.py to refresh CLAUDE.md."""
     try:
@@ -314,7 +334,10 @@ def main():
         date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
         args.branch = f"agent/{slug}-{date_str}"
 
-    # Step 0: Update CLAUDE.md primer
+    # Step 0a: Sync skill files to .openclaw workspace
+    sync_skill_files()
+
+    # Step 0b: Update CLAUDE.md primer
     update_primer(args.project, args.task)
 
     # Step 1: Gatekeeper check
