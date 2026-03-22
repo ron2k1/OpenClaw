@@ -548,10 +548,15 @@ class PipelineMonitor:
 
 # ── Main ───────────────────────────────────────────────────────────────
 
-async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
-    """Called by JobQueue every POLL_INTERVAL seconds."""
-    monitor: PipelineMonitor = context.bot_data["monitor"]
-    await monitor.poll()
+async def _background_poller(app: Application, monitor: PipelineMonitor):
+    """Background loop that polls pipeline state every POLL_INTERVAL seconds."""
+    await monitor.start()
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            await monitor.poll()
+        except Exception as e:
+            print(f"Poll error: {e}")
 
 
 def main():
@@ -584,10 +589,7 @@ def main():
     app.bot_data["monitor"] = monitor
 
     async def post_init(application: Application):
-        await monitor.start()
-        application.job_queue.run_repeating(
-            poll_loop, interval=POLL_INTERVAL, first=POLL_INTERVAL
-        )
+        asyncio.create_task(_background_poller(application, monitor))
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
