@@ -110,7 +110,7 @@ def create_branch(branch_name: str, project_path: str) -> bool:
         has_changes = bool(status.stdout.strip())
         if has_changes:
             subprocess.run(
-                ["git", "stash", "push", "-m", f"bridge-auto-stash-before-{branch_name}"],
+                ["git", "stash", "push", "-u", "-m", f"bridge-auto-stash-before-{branch_name}"],
                 cwd=project_path, capture_output=True, text=True, check=True,
             )
 
