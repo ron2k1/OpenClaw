@@ -12,9 +12,11 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +28,60 @@ GATEKEEPER = OPENCLAW_ROOT / "gatekeeper" / "gatekeeper.py"
 AUDIT_LOG = OPENCLAW_ROOT / "audit_log.jsonl"
 SCRIPTS_DIR = OPENCLAW_ROOT / "scripts"
 SKILL_DIR = Path.home() / ".openclaw" / "workspace" / "skills" / "claude-code-bridge" / "claude-code-bridge"
+
+# Files modified by the pipeline itself — excluded from files_changed output
+INTERNAL_FILES = {"CLAUDE.md", "tasks/state.json", "audit_log.jsonl"}
+INTERNAL_PREFIXES = ("tasks/state_history/",)
+
+# Context rot prevention — appended to interactive (non-print) task prompts
+COMPACT_INSTRUCTION = "\n\nIf context reaches 40%, run /compact before continuing."
+
+
+class RepoLock:
+    """Per-repo file lock for safe parallel agent access (Windows + POSIX)."""
+
+    def __init__(self, project_path: str, timeout: int = 120):
+        self.lock_path = Path(project_path) / ".git" / "bridge.lock"
+        self.timeout = timeout
+        self._fh = None
+
+    def __enter__(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self._fh = open(self.lock_path, "w")
+                if platform.system() == "Windows":
+                    import msvcrt
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except (OSError, IOError):
+                if self._fh:
+                    self._fh.close()
+                    self._fh = None
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Could not acquire repo lock at {self.lock_path} "
+                        f"within {self.timeout}s"
+                    )
+                time.sleep(0.5)
+
+    def __exit__(self, *args):
+        if self._fh:
+            try:
+                if platform.system() == "Windows":
+                    import msvcrt
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fh, fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
 
 # Claude Code executable — try common locations
 CLAUDE_CANDIDATES = [
@@ -98,68 +154,72 @@ def create_branch(branch_name: str, project_path: str) -> tuple:
     Ensures isolation by switching back to main/master before creating the
     new branch, so sequential tasks don't stack on each other.  Any
     uncommitted changes are stashed beforehand and popped after checkout.
+    Uses a per-repo file lock to prevent races between parallel agents.
 
     Returns (success: bool, error_detail: str | None).
     """
     has_changes = False
     try:
-        base = get_base_branch(project_path)
+        with RepoLock(project_path):
+            base = get_base_branch(project_path)
 
-        # Resolve any unmerged paths (e.g. leftover merge conflicts)
-        unmerged = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=U"],
-            cwd=project_path, capture_output=True, text=True,
-        )
-        if unmerged.stdout.strip():
-            # Reset unmerged files to HEAD so stash/checkout can proceed
-            for f in unmerged.stdout.strip().splitlines():
-                subprocess.run(
-                    ["git", "checkout", "HEAD", "--", f.strip()],
-                    cwd=project_path, capture_output=True, text=True,
-                )
-            subprocess.run(
-                ["git", "reset", "HEAD"],
+            # Resolve any unmerged paths (e.g. leftover merge conflicts)
+            unmerged = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=U"],
                 cwd=project_path, capture_output=True, text=True,
             )
+            if unmerged.stdout.strip():
+                # Reset unmerged files to HEAD so stash/checkout can proceed
+                for f in unmerged.stdout.strip().splitlines():
+                    subprocess.run(
+                        ["git", "checkout", "HEAD", "--", f.strip()],
+                        cwd=project_path, capture_output=True, text=True,
+                    )
+                subprocess.run(
+                    ["git", "reset", "HEAD"],
+                    cwd=project_path, capture_output=True, text=True,
+                )
 
-        # Stash any uncommitted changes so checkout doesn't fail
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=project_path, capture_output=True, text=True,
-        )
-        has_changes = bool(status.stdout.strip())
-        if has_changes:
+            # Stash any uncommitted changes so checkout doesn't fail
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=project_path, capture_output=True, text=True,
+            )
+            has_changes = bool(status.stdout.strip())
+            if has_changes:
+                subprocess.run(
+                    ["git", "stash", "push", "-u", "-m", f"bridge-auto-stash-before-{branch_name}"],
+                    cwd=project_path, capture_output=True, text=True, check=True,
+                )
+
+            # Switch to base branch so the new branch forks from it
             subprocess.run(
-                ["git", "stash", "push", "-u", "-m", f"bridge-auto-stash-before-{branch_name}"],
+                ["git", "checkout", base],
                 cwd=project_path, capture_output=True, text=True, check=True,
             )
 
-        # Switch to base branch so the new branch forks from it
-        subprocess.run(
-            ["git", "checkout", base],
-            cwd=project_path, capture_output=True, text=True, check=True,
-        )
-
-        # Delete existing branch with same name (stale from prior run)
-        subprocess.run(
-            ["git", "branch", "-D", branch_name],
-            cwd=project_path, capture_output=True, text=True,
-        )
-
-        # Create and switch to the new task branch
-        subprocess.run(
-            ["git", "checkout", "-b", branch_name],
-            cwd=project_path, capture_output=True, text=True, check=True,
-        )
-
-        # Restore stashed changes if any
-        if has_changes:
+            # Delete existing branch with same name (stale from prior run)
             subprocess.run(
-                ["git", "stash", "pop"],
+                ["git", "branch", "-D", branch_name],
                 cwd=project_path, capture_output=True, text=True,
             )
 
-        return True, None
+            # Create and switch to the new task branch
+            subprocess.run(
+                ["git", "checkout", "-b", branch_name],
+                cwd=project_path, capture_output=True, text=True, check=True,
+            )
+
+            # Restore stashed changes if any
+            if has_changes:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=project_path, capture_output=True, text=True,
+                )
+
+            return True, None
+    except TimeoutError as e:
+        return False, str(e)
     except subprocess.CalledProcessError as e:
         detail = f"cmd={e.cmd}, rc={e.returncode}, stderr={e.stderr}"
         # If something failed mid-way, try to pop stash so work isn't lost
@@ -171,8 +231,16 @@ def create_branch(branch_name: str, project_path: str) -> tuple:
         return False, detail
 
 
+def _is_internal(filename: str) -> bool:
+    """Check if a file is an internal pipeline artifact."""
+    normalized = filename.replace("\\", "/")
+    if normalized in INTERNAL_FILES:
+        return True
+    return any(normalized.startswith(p) for p in INTERNAL_PREFIXES)
+
+
 def get_changed_files(project_path: str) -> list:
-    """Get list of changed files from git."""
+    """Get list of changed files from git, excluding internal pipeline files."""
     try:
         # Check both staged and unstaged, plus untracked
         result = subprocess.run(
@@ -184,7 +252,7 @@ def get_changed_files(project_path: str) -> list:
             if line.strip():
                 # git status --porcelain format: "XY filename"
                 filename = line[3:].strip()
-                if filename:
+                if filename and not _is_internal(filename):
                     files.append(filename)
         return files
     except Exception:
@@ -227,11 +295,14 @@ def run_claude(task: str, project_path: str, print_only: bool = False) -> dict:
     """Invoke Claude Code CLI and capture output."""
     claude_exe = find_claude()
 
+    # Inject context rot prevention for interactive sessions
+    effective_task = task if print_only else task + COMPACT_INSTRUCTION
+
     if print_only:
-        cmd = [claude_exe, "--print", task]
+        cmd = [claude_exe, "--print", effective_task]
     else:
         cmd = [claude_exe, "-p", "--permission-mode", "bypassPermissions",
-               "--output-format", "json", task]
+               "--output-format", "json", effective_task]
 
     try:
         result = subprocess.run(
@@ -319,7 +390,7 @@ def update_primer(project: str, task: str):
 def write_state(project: str, task: str, status: str, gate_result: dict,
                 claude_result: dict = None, files_changed: list = None,
                 self_heal_attempts: int = 0, quality_results: dict = None,
-                next_suggested: str = ""):
+                next_suggested: str = "", error: str = None):
     """Write state.json via state_manager."""
     try:
         sys.path.insert(0, str(SCRIPTS_DIR))
@@ -334,7 +405,7 @@ def write_state(project: str, task: str, status: str, gate_result: dict,
             files_changed=files_changed or [],
             claude_output=claude_result.get("output", "") if claude_result else "",
             exit_code=claude_result.get("exit_code") if claude_result else None,
-            error=claude_result.get("error") if claude_result else None,
+            error=error if error is not None else (claude_result.get("error") if claude_result else None),
             next_suggested=next_suggested,
             self_heal_attempts=self_heal_attempts,
             quality_results=quality_results or {},
@@ -505,6 +576,7 @@ def main():
         return
 
     # Step 3: Create branch if requested
+    branch_created = False
     if args.branch:
         branch_ok, branch_err = create_branch(args.branch, args.project)
         if not branch_ok:
@@ -514,90 +586,101 @@ def main():
             write_state(args.project, args.task, "branch_failed", gate_result)
             print(json.dumps(output, indent=2))
             return
+        branch_created = True
 
-    # Step 4: Run Claude Code
-    claude_result = run_claude(args.task, args.project, args.print_only)
+    # Steps 4-6 wrapped in try/finally to restore base branch after task
+    try:
+        # Step 4: Run Claude Code
+        claude_result = run_claude(args.task, args.project, args.print_only)
 
-    output["claude_output"] = claude_result["output"]
-    output["exit_code"] = claude_result["exit_code"]
+        output["claude_output"] = claude_result["output"]
+        output["exit_code"] = claude_result["exit_code"]
 
-    if claude_result["error"]:
-        output["error"] = claude_result["error"]
-        log_audit(args.task, gate_result["tier"], "claude_error",
-                  gate_result["mode"], claude_result["error"])
-        write_state(args.project, args.task, "claude_error", gate_result, claude_result)
+        if claude_result["error"]:
+            output["error"] = claude_result["error"]
+            log_audit(args.task, gate_result["tier"], "claude_error",
+                      gate_result["mode"], claude_result["error"])
+            write_state(args.project, args.task, "claude_error", gate_result, claude_result)
 
-    elif claude_result["exit_code"] != 0:
-        error_text = claude_result["stderr"] or f"Exit code {claude_result['exit_code']}"
-        output["error"] = f"Claude Code exited with code {claude_result['exit_code']}"
-        if claude_result["stderr"]:
-            output["error"] += f": {claude_result['stderr'][:500]}"
+        elif claude_result["exit_code"] != 0:
+            error_text = claude_result["stderr"] or f"Exit code {claude_result['exit_code']}"
+            output["error"] = f"Claude Code exited with code {claude_result['exit_code']}"
+            if claude_result["stderr"]:
+                output["error"] += f": {claude_result['stderr'][:500]}"
 
-        # Step 5: Self-heal if enabled and Claude failed
-        if args.self_heal:
-            heal_result = run_self_heal(
-                args.project, args.task, error_text, args.max_heal_attempts,
-            )
-            output["self_heal"] = heal_result
+            # Step 5: Self-heal if enabled and Claude failed
+            if args.self_heal:
+                heal_result = run_self_heal(
+                    args.project, args.task, error_text, args.max_heal_attempts,
+                )
+                output["self_heal"] = heal_result
 
-            if heal_result["healed"]:
-                output["success"] = True
-                output["error"] = None
-                output["files_changed"] = get_changed_files(args.project)
-                if output["files_changed"]:
-                    committed = auto_commit(args.project, args.task, args.branch or "")
-                    output["committed"] = committed
-                log_audit(args.task, gate_result["tier"], "self_healed",
-                          gate_result["mode"],
-                          f"Healed after {heal_result['attempts']} attempt(s)")
-                write_state(args.project, args.task, "self_healed", gate_result,
-                            claude_result, output["files_changed"],
-                            self_heal_attempts=heal_result["attempts"])
+                if heal_result["healed"]:
+                    output["success"] = True
+                    output["error"] = None
+                    output["files_changed"] = get_changed_files(args.project)
+                    if output["files_changed"]:
+                        committed = auto_commit(args.project, args.task, args.branch or "")
+                        output["committed"] = committed
+                    log_audit(args.task, gate_result["tier"], "self_healed",
+                              gate_result["mode"],
+                              f"Healed after {heal_result['attempts']} attempt(s)")
+                    write_state(args.project, args.task, "self_healed", gate_result,
+                                claude_result, output["files_changed"],
+                                self_heal_attempts=heal_result["attempts"])
+                else:
+                    log_audit(args.task, gate_result["tier"], "self_heal_failed",
+                              gate_result["mode"],
+                              f"Failed after {heal_result['attempts']} attempt(s)")
+                    write_state(args.project, args.task, "self_heal_failed", gate_result,
+                                claude_result, self_heal_attempts=heal_result["attempts"],
+                                error=output["error"])
             else:
-                log_audit(args.task, gate_result["tier"], "self_heal_failed",
-                          gate_result["mode"],
-                          f"Failed after {heal_result['attempts']} attempt(s)")
-                write_state(args.project, args.task, "self_heal_failed", gate_result,
-                            claude_result, self_heal_attempts=heal_result["attempts"],
+                log_audit(args.task, gate_result["tier"], "claude_failed",
+                          gate_result["mode"], output["error"])
+                write_state(args.project, args.task, "failed", gate_result, claude_result,
                             error=output["error"])
+
         else:
-            log_audit(args.task, gate_result["tier"], "claude_failed",
-                      gate_result["mode"], output["error"])
-            write_state(args.project, args.task, "failed", gate_result, claude_result,
-                        error=output["error"])
+            # Success — Claude exited cleanly
+            output["success"] = True
+            output["files_changed"] = get_changed_files(args.project)
 
-    else:
-        # Success — Claude exited cleanly
-        output["success"] = True
-        output["files_changed"] = get_changed_files(args.project)
+            # Parse Claude's JSON output for extra data
+            parsed = parse_claude_json_output(claude_result["output"])
+            output["cost_usd"] = parsed.get("cost_usd", 0)
 
-        # Parse Claude's JSON output for extra data
-        parsed = parse_claude_json_output(claude_result["output"])
-        output["cost_usd"] = parsed.get("cost_usd", 0)
+            # Step 5: Quality gates (if enabled)
+            if args.quality_gates and not args.print_only and output["files_changed"]:
+                qg_result = run_quality_gates(
+                    args.project, output["files_changed"], args.task,
+                    skip_adversarial=args.skip_adversarial,
+                    skip_coverage=args.skip_coverage,
+                    skip_regression=args.skip_regression,
+                )
+                output["quality_gates"] = qg_result
 
-        # Step 5: Quality gates (if enabled)
-        if args.quality_gates and not args.print_only and output["files_changed"]:
-            qg_result = run_quality_gates(
-                args.project, output["files_changed"], args.task,
-                skip_adversarial=args.skip_adversarial,
-                skip_coverage=args.skip_coverage,
-                skip_regression=args.skip_regression,
-            )
-            output["quality_gates"] = qg_result
-
-            if not qg_result["passed"]:
-                # Hard gate failed — try self-heal if enabled
-                if args.self_heal and qg_result.get("first_hard_error"):
-                    heal_result = run_self_heal(
-                        args.project, args.task, qg_result["first_hard_error"],
-                        args.max_heal_attempts,
-                    )
-                    output["self_heal"] = heal_result
-                    if heal_result["healed"]:
-                        output["files_changed"] = get_changed_files(args.project)
-                        log_audit(args.task, gate_result["tier"], "quality_healed",
-                                  gate_result["mode"],
-                                  f"Quality gate healed after {heal_result['attempts']} attempt(s)")
+                if not qg_result["passed"]:
+                    # Hard gate failed — try self-heal if enabled
+                    if args.self_heal and qg_result.get("first_hard_error"):
+                        heal_result = run_self_heal(
+                            args.project, args.task, qg_result["first_hard_error"],
+                            args.max_heal_attempts,
+                        )
+                        output["self_heal"] = heal_result
+                        if heal_result["healed"]:
+                            output["files_changed"] = get_changed_files(args.project)
+                            log_audit(args.task, gate_result["tier"], "quality_healed",
+                                      gate_result["mode"],
+                                      f"Quality gate healed after {heal_result['attempts']} attempt(s)")
+                        else:
+                            output["success"] = False
+                            output["error"] = f"Quality gates failed: {', '.join(qg_result['hard_failures'])}"
+                            log_audit(args.task, gate_result["tier"], "quality_failed",
+                                      gate_result["mode"], output["error"])
+                            write_state(args.project, args.task, "quality_failed", gate_result,
+                                        claude_result, output["files_changed"],
+                                        quality_results=qg_result)
                     else:
                         output["success"] = False
                         output["error"] = f"Quality gates failed: {', '.join(qg_result['hard_failures'])}"
@@ -606,49 +689,53 @@ def main():
                         write_state(args.project, args.task, "quality_failed", gate_result,
                                     claude_result, output["files_changed"],
                                     quality_results=qg_result)
-                else:
-                    output["success"] = False
-                    output["error"] = f"Quality gates failed: {', '.join(qg_result['hard_failures'])}"
-                    log_audit(args.task, gate_result["tier"], "quality_failed",
-                              gate_result["mode"], output["error"])
-                    write_state(args.project, args.task, "quality_failed", gate_result,
-                                claude_result, output["files_changed"],
-                                quality_results=qg_result)
 
-        # Step 5a: Auto-commit (only if still successful)
-        if output["success"] and not args.print_only and output["files_changed"]:
-            committed = auto_commit(args.project, args.task, args.branch or "")
-            output["committed"] = committed
+            # Step 5a: Auto-commit (only if still successful)
+            if output["success"] and not args.print_only and output["files_changed"]:
+                committed = auto_commit(args.project, args.task, args.branch or "")
+                output["committed"] = committed
 
-            # Step 5b: Auto-push (if enabled and committed)
-            if args.auto_push and committed and args.branch:
-                try:
-                    push_result = subprocess.run(
-                        ["git", "push", "-u", "origin", args.branch],
-                        cwd=args.project, capture_output=True, text=True, timeout=60,
-                    )
-                    output["pushed"] = push_result.returncode == 0
-                except Exception:
-                    output["pushed"] = False
+                # Step 5b: Auto-push (if enabled and committed)
+                if args.auto_push and committed and args.branch:
+                    try:
+                        push_result = subprocess.run(
+                            ["git", "push", "-u", "origin", args.branch],
+                            cwd=args.project, capture_output=True, text=True, timeout=60,
+                        )
+                        output["pushed"] = push_result.returncode == 0
+                    except Exception:
+                        output["pushed"] = False
 
-        if output["success"]:
-            log_audit(args.task, gate_result["tier"], "completed",
-                      gate_result["mode"], f"Files changed: {len(output['files_changed'])}")
-            write_state(args.project, args.task, "success", gate_result, claude_result,
-                        output["files_changed"],
-                        quality_results=output.get("quality_gates"),
-                        next_suggested=f"Review changes: {', '.join(output['files_changed'][:5])}")
+            if output["success"]:
+                log_audit(args.task, gate_result["tier"], "completed",
+                          gate_result["mode"], f"Files changed: {len(output['files_changed'])}")
+                write_state(args.project, args.task, "success", gate_result, claude_result,
+                            output["files_changed"],
+                            quality_results=output.get("quality_gates"),
+                            next_suggested=f"Review changes: {', '.join(output['files_changed'][:5])}")
 
-    # Step 6: Write to Obsidian vault
-    cost = output.get("cost_usd", 0)
-    write_obsidian(
-        args.project, args.task, "success" if output["success"] else "failed",
-        gate_result, claude_result if claude_result else None,
-        output.get("files_changed"), output.get("self_heal"),
-        cost_usd=cost, branch=args.branch or "",
-    )
+        # Step 6: Write to Obsidian vault
+        cost = output.get("cost_usd", 0)
+        write_obsidian(
+            args.project, args.task, "success" if output["success"] else "failed",
+            gate_result, claude_result if claude_result else None,
+            output.get("files_changed"), output.get("self_heal"),
+            cost_usd=cost, branch=args.branch or "",
+        )
 
-    print(json.dumps(output, indent=2))
+        print(json.dumps(output, indent=2))
+
+    finally:
+        # Restore repo to base branch so it's not left on an agent branch
+        if branch_created:
+            try:
+                base = get_base_branch(args.project)
+                subprocess.run(
+                    ["git", "checkout", base],
+                    cwd=args.project, capture_output=True, text=True,
+                )
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
