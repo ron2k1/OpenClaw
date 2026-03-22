@@ -265,6 +265,7 @@ def sync_skill_files():
         syncs = [
             (OPENCLAW_ROOT / "SKILLS.md", SKILL_DIR / "SKILL.md"),
             (OPENCLAW_ROOT / "scripts" / "bridge.py", SKILL_DIR / "scripts" / "bridge.py"),
+            (OPENCLAW_ROOT / "scripts" / "quality_gate.py", SKILL_DIR / "scripts" / "quality_gate.py"),
             (OPENCLAW_ROOT / "gatekeeper" / "gatekeeper.py", SKILL_DIR / "scripts" / "gatekeeper.py"),
         ]
         for src, dst in syncs:
