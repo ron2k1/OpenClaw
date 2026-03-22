@@ -92,15 +92,35 @@ def get_base_branch(project_path: str) -> str:
     return "main"
 
 
-def create_branch(branch_name: str, project_path: str) -> bool:
+def create_branch(branch_name: str, project_path: str) -> tuple:
     """Create and checkout a git branch from the base branch.
 
     Ensures isolation by switching back to main/master before creating the
     new branch, so sequential tasks don't stack on each other.  Any
     uncommitted changes are stashed beforehand and popped after checkout.
+
+    Returns (success: bool, error_detail: str | None).
     """
+    has_changes = False
     try:
         base = get_base_branch(project_path)
+
+        # Resolve any unmerged paths (e.g. leftover merge conflicts)
+        unmerged = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=project_path, capture_output=True, text=True,
+        )
+        if unmerged.stdout.strip():
+            # Reset unmerged files to HEAD so stash/checkout can proceed
+            for f in unmerged.stdout.strip().splitlines():
+                subprocess.run(
+                    ["git", "checkout", "HEAD", "--", f.strip()],
+                    cwd=project_path, capture_output=True, text=True,
+                )
+            subprocess.run(
+                ["git", "reset", "HEAD"],
+                cwd=project_path, capture_output=True, text=True,
+            )
 
         # Stash any uncommitted changes so checkout doesn't fail
         status = subprocess.run(
@@ -139,15 +159,16 @@ def create_branch(branch_name: str, project_path: str) -> bool:
                 cwd=project_path, capture_output=True, text=True,
             )
 
-        return True
-    except subprocess.CalledProcessError:
+        return True, None
+    except subprocess.CalledProcessError as e:
+        detail = f"cmd={e.cmd}, rc={e.returncode}, stderr={e.stderr}"
         # If something failed mid-way, try to pop stash so work isn't lost
         if has_changes:
             subprocess.run(
                 ["git", "stash", "pop"],
                 cwd=project_path, capture_output=True, text=True,
             )
-        return False
+        return False, detail
 
 
 def get_changed_files(project_path: str) -> list:
@@ -485,8 +506,9 @@ def main():
 
     # Step 3: Create branch if requested
     if args.branch:
-        if not create_branch(args.branch, args.project):
-            output["error"] = f"Failed to create branch: {args.branch}"
+        branch_ok, branch_err = create_branch(args.branch, args.project)
+        if not branch_ok:
+            output["error"] = f"Failed to create branch: {args.branch} ({branch_err})"
             log_audit(args.task, gate_result["tier"], "branch_failed",
                       gate_result["mode"], output["error"])
             write_state(args.project, args.task, "branch_failed", gate_result)
