@@ -5,6 +5,9 @@ tasks/state_history/
 tasks/pending_approval.json
 errors/build_failures.md
 
+# Environment
+.env
+
 # Python
 __pycache__/
 *.pyc
