@@ -120,6 +120,12 @@ def create_branch(branch_name: str, project_path: str) -> bool:
             cwd=project_path, capture_output=True, text=True, check=True,
         )
 
+        # Delete existing branch with same name (stale from prior run)
+        subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=project_path, capture_output=True, text=True,
+        )
+
         # Create and switch to the new task branch
         subprocess.run(
             ["git", "checkout", "-b", branch_name],
