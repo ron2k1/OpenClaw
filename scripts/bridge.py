@@ -206,6 +206,39 @@ def write_state(project: str, task: str, status: str, gate_result: dict,
             sys.path.remove(str(SCRIPTS_DIR))
 
 
+def write_obsidian(project: str, task: str, status: str, gate_result: dict,
+                   claude_result: dict = None, files_changed: list = None,
+                   self_heal: dict = None, cost_usd: float = 0, branch: str = ""):
+    """Write session entry and update agent memory in Obsidian vault."""
+    try:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from obsidian_writer import write_session_entry, update_claude_output, update_grok_memory
+
+        write_session_entry(
+            project_root=Path(project), task=task, status=status,
+            tier=gate_result.get("tier", ""), mode=gate_result.get("mode", ""),
+            files_changed=files_changed or [],
+            claude_output=claude_result.get("output", "") if claude_result else "",
+            error=claude_result.get("error") if claude_result else None,
+            self_heal=self_heal, cost_usd=cost_usd, branch=branch,
+        )
+        update_claude_output(
+            project_root=Path(project), task=task, status=status,
+            tier=gate_result.get("tier", ""), mode=gate_result.get("mode", ""),
+            files_changed=files_changed or [],
+            error=claude_result.get("error") if claude_result else None,
+            cost_usd=cost_usd,
+        )
+        update_grok_memory(
+            project_root=Path(project), last_task=task, last_status=status,
+        )
+    except Exception:
+        pass
+    finally:
+        if str(SCRIPTS_DIR) in sys.path:
+            sys.path.remove(str(SCRIPTS_DIR))
+
+
 def run_self_heal(project: str, task: str, error_text: str, max_attempts: int = 3) -> dict:
     """Run the self-heal loop."""
     try:
@@ -366,6 +399,15 @@ def main():
         write_state(args.project, args.task, "success", gate_result, claude_result,
                     output["files_changed"],
                     next_suggested=f"Review changes: {', '.join(output['files_changed'][:5])}")
+
+    # Step 6: Write to Obsidian vault
+    cost = output.get("cost_usd", 0)
+    write_obsidian(
+        args.project, args.task, "success" if output["success"] else "failed",
+        gate_result, claude_result if claude_result else None,
+        output.get("files_changed"), output.get("self_heal"),
+        cost_usd=cost, branch=args.branch or "",
+    )
 
     print(json.dumps(output, indent=2))
 
