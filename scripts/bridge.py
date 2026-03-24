@@ -259,6 +259,39 @@ def get_changed_files(project_path: str) -> list:
         return []
 
 
+def verify_writes(project_path: str, files_changed: list) -> tuple:
+    """Verify claimed changed files exist on disk and in git status.
+    Returns (missing_from_disk, not_in_git) lists."""
+    missing_from_disk = []
+    not_in_git = []
+
+    for f in files_changed:
+        full = Path(project_path) / f
+        if not full.exists():
+            missing_from_disk.append(f)
+        elif full.stat().st_size == 0:
+            missing_from_disk.append(f)  # Zero-byte = likely phantom
+
+    # Cross-check: run git status to confirm changes are real
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_path, capture_output=True, text=True, timeout=10,
+        )
+        git_changed = {
+            line[3:].strip().strip('"')
+            for line in result.stdout.splitlines()
+            if line.strip()
+        }
+        for f in files_changed:
+            if f not in git_changed:
+                not_in_git.append(f)
+    except Exception:
+        pass  # Git check is best-effort
+
+    return missing_from_disk, not_in_git
+
+
 def auto_commit(project_path: str, task: str, branch: str = "") -> bool:
     """Stage all changes and commit with a descriptive message."""
     try:
@@ -306,7 +339,7 @@ def run_claude(task: str, project_path: str, print_only: bool = False) -> dict:
 
     try:
         result = subprocess.run(
-            cmd, cwd=project_path, capture_output=True, text=True, timeout=600,
+            cmd, cwd=project_path, capture_output=True, text=True, timeout=1800,
         )
         return {
             "output": result.stdout, "stderr": result.stderr,
@@ -314,7 +347,7 @@ def run_claude(task: str, project_path: str, print_only: bool = False) -> dict:
         }
     except subprocess.TimeoutExpired:
         return {"output": "", "stderr": "", "exit_code": -1,
-                "error": "Claude Code timed out after 5 minutes"}
+                "error": "Claude Code timed out after 30 minutes"}
     except FileNotFoundError:
         return {"output": "", "stderr": "", "exit_code": -1,
                 "error": f"Claude Code not found. Tried: {claude_exe}"}
@@ -645,6 +678,16 @@ def main():
             # Success — Claude exited cleanly
             output["success"] = True
             output["files_changed"] = get_changed_files(args.project)
+
+            # Verify claimed writes actually exist on disk
+            if output["files_changed"]:
+                missing, not_in_git = verify_writes(args.project, output["files_changed"])
+                if missing:
+                    output["success"] = False
+                    output["error"] = f"Phantom writes detected — files missing from disk: {missing}"
+                    output["verify_missing"] = missing
+                elif not_in_git:
+                    output["verify_not_in_git"] = not_in_git  # Warning only
 
             # Parse Claude's JSON output for extra data
             parsed = parse_claude_json_output(claude_result["output"])
